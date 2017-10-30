@@ -1,0 +1,148 @@
+#############################################
+### Porto Seguro’s Safe Driver Prediction ###
+#############################################
+
+setwd("/Users/sundeepblue/sundeep/yuyu/car_insurance")
+
+library(mice) 
+library(VIM)
+library(plotly)
+library(dplyr)
+library(Rtsne)
+library(caret)
+library(mlbench)
+library(ranger)
+library(factoextra)
+library(ggplot2)
+library(caret)
+library(caTools)
+
+# import the train data
+train = read.csv("train.csv")
+
+# the general structure of the data
+head(train)
+names(train)
+str(train) 
+dim(train) 
+
+################################ descriptive and missing data analysis ################################
+# replace missing data as NA
+train[train == -1] = NA
+# no need to analyze ID
+train_noID = train[, -1]
+
+# descriptive statistics 
+summary(train_noID) 
+# the target variable is rather imbalanced
+table(train_noID$target) 
+# return the length of the unqiue values in each varible, missing value does not count
+var_value = lapply(apply(train_noID, 2, function(x)unique(x[!is.na(x)])), length) 
+var_names_noBin = names(var_value)[lapply(var_value, function(x)x==2) != TRUE]
+var_names_Bin = names(var_value)[lapply(var_value, function(x)x==2) == TRUE]
+
+# missing data
+md.pattern(train_noID) # need to report percentage of missing data
+aggr(train_noID, prop = F, nnumbers = T, cex.axis = .6)
+# matrixplot(train_noID[, -1], interactive = F, sortby = "target")
+miss_ind = as.data.frame(abs(is.na(train_noID)))
+# Create a correlation matrix: missing values of these variables have low to medium
+round(cor(miss_ind[, sapply(miss_ind, sd) > 0]), 2) 
+
+# proportions of binary features
+table_bin = apply(train_noID[var_names_Bin], 2, table)
+prop.table(table_bin, 2)
+
+# correlation of non-binary features
+# round(cor(train_noID, use = "pairwise.complete.obs"), 2)
+cor_noBin = as.matrix(cor(train_noID[var_names_noBin], 
+                          use = "pairwise.complete.obs"), 2) # low to medium
+colnames(cor_noBin) = var_names_noBin
+rownames(cor_noBin) = var_names_noBin
+p_cor = plot_ly(x = var_names_noBin, 
+                y = var_names_noBin, 
+                z = cor_noBin, type = "heatmap") %>%
+    layout(title = "Correlation between non-binary features",
+           titlefont = list(size = 12),
+           font = list(size = 7))
+
+################################ EDA ################################
+# imbalanced data --> balance sampling
+train_zero = train_noID %>% filter(target == 0)
+set.seed(44)
+train_zero_sample = train_zero[sample(1:nrow(train_zero),
+                                      size = sum(train_noID$target == 1),
+                                      replace = FALSE), ]
+train_bal = rbind(train_zero_sample, train_noID[which(train_noID$target == 1), ])
+
+# multiple imputation using mice
+train_mi_impute = mice(train_bal, m = 3, maxit = 5, seed = 11, printFlag = TRUE)
+train_mi = complete(train_mi_impute, action = 3) # use this as an example
+write.csv(train_mi, "train_mi.csv", row.names = F)
+train_mi = read.csv("train_mi.csv")
+
+# PCA
+pca = prcomp(train_mi, scale = TRUE)
+#  scree plot
+fviz_eig(pca, ncp = 58)
+# graph of variables
+fviz_pca_var(pca,
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE)     # Avoid text overlapping
+
+# t-SNE
+set.seed(22) 
+tsne_out = Rtsne(as.matrix(train_mi[, -1]), 
+                 dims = 3, 
+                 pca = FALSE, 
+                 perplexity = 30)
+# Show the objects in the 3D tsne representation
+plot(tsne_out$Y, col = as.character(train_mi$target))
+p_tsne = plot_ly(x = ~tsne_out$Y[, 1], 
+                 y = ~tsne_out$Y[, 2], 
+                 z = ~tsne_out$Y[, 3], 
+                 marker = list(size = 2),
+                 color = ~as.character(train_mi$target), colors = c('#BF382A', '#0C4B8E')) %>%
+    layout(scene = list(xaxis = list(title = ''),
+                        yaxis = list(title = ''),
+                        zaxis = list(title = '')))
+
+
+################################ modeling ################################
+# randomly order the data for spliting into train and dev
+set.seed(55)
+train_mi = train_mi[sample(nrow(train_mi)), ]
+split = round(nrow(train_mi)*.80)
+train_mod = train_mi[1: split, ]
+dev_mod = train_mi[(split+1):nrow(train_mi), ]
+# confirm the split
+nrow(train_mod) / nrow(dev_mod)
+
+# logistic regression 
+mod_lr = glm(data = train_mod, formula = target ~ ., family = binomial(link='logit'))
+# predict on test
+p_lr = predict(mod_lr, dev_mod, type = "response")
+# assign the classes
+p_lr_target = ifelse(p_lr > .50, 1, 0)
+# create the confusion matrix
+table(p_lr_target, dev_mod[["target"]]) # precision = 0.55 recall = 0.60
+# use the caret's helper function to calculate additional statistics
+confusionMatrix(p_lr_target, dev_mod[["target"]])
+# plot the ROC curve
+colAUC(p_lr_target, dev_mod[["target"]], plotROC = TRUE)
+
+# random forest
+# fit a randomly forest model using tuneLength with a single tuning parameter mtry
+set.seed(66)
+mod1_rf = train(target ~.,
+                tuneLength = 1,  # tuneLength: the total number of unique combinations specified
+                data = train_mi, 
+                method = "ranger",
+                trControl = trainControl(method = "cv", number = 8, verboseIter = TRUE)) 
+# fit a randomly forest model using custom tuning grid
+myGrid = data.frame(mtry = c(3, 4, 5, 10, 20))
+set.seed = 77
+mod2_rf = train(target ~., data = train_mod, method = "ranger", tuneGrid = myGrid)
+plot(mod2_rf)
+

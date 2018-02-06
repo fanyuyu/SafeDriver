@@ -1,0 +1,336 @@
+---
+title: "Porto Seguro Safe Driver Prediction"
+author: "YuyuFan"
+date: "11/14/2017"
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup libraries
+
+```{r message=FALSE, warning=FALSE}
+setwd("/Users/yuyu/Google Drive/projects/car_insurance")
+# data manipulation
+library(dplyr) 
+
+# missing data
+library(mice)
+library(VIM) 
+
+# plot
+library(plotly) 
+library(ggplot2) 
+
+# modeling
+library(caret)
+library(mlbench)
+library(ranger)
+library(factoextra)
+library(caTools)
+library(gbm)
+library(xgboost)
+library(nnet)
+```
+
+# Data loading
+
+```{r results='hide', message=FALSE, warning=FALSE}
+# import data
+train = read.csv("train.csv")
+
+# the general structure of the data
+dim(train) # 595212     59
+str(train) 
+head(train)
+
+## data cleaning and necessary transformations
+# replace missing data as NA
+train[train == -1] = NA
+# no need to analyze ID
+train_noID = train[, -1]
+# change categorical vars as factor
+var_cat = names(train_noID)[grepl("_cat", names(train_noID))]
+train_noID[var_cat] = lapply(train_noID[var_cat], factor)
+# check the dataframe
+str(train_noID)
+```
+
+
+# EDA
+```{r}
+# general descriptives of all vars
+summary(train_noID) 
+# target variable
+table(train_noID$target) # the target variable is rather imbalanced
+
+
+# relationships between categorical variables 
+cat_targ_plot = function(data, target, cat){
+    theme_update(plot.title = element_text(hjust = 0.5))
+    ggplot(data = data, aes(x = as.factor(data[[cat]]), 
+                            group = as.factor(target), 
+                            fill = as.factor(target))) +
+        geom_bar(aes(y = (..count..)/sum(..count..))) +
+        labs(title = paste("target vs", cat), 
+             y = "Percent", 
+             x = cat,
+             fill = "target")
+}
+
+for (cat in var_cat){
+    assign(paste("plot_targ_", cat, sep = ""),
+           cat_targ_plot(data = train_noID, target = target, cat = cat)
+    )
+}
+
+plot_targ_ps_car_01_cat
+plot_targ_ps_car_04_cat
+plot_targ_ps_car_06_cat
+plot_targ_ps_car_09_cat
+```
+
+
+## Relationship between numerical variables
+```{r}
+var_num = names(train_noID)[!grepl("_cat", names(train_noID))]
+# correlation of numeric features
+# round(cor(train_noID, use = "pairwise.complete.obs"), 2)
+cor_num = as.matrix(cor(train_noID[var_num], 
+                        use = "pairwise.complete.obs"), 2) # low to medium
+colnames(cor_num) = var_num
+rownames(cor_num) = var_num
+p_cor = plot_ly(x = var_num, 
+                y = var_num, 
+                z = cor_num, type = "heatmap") %>%
+    layout(title = "Correlation between non-binary features",
+           titlefont = list(size = 12),
+           font = list(size = 7))
+p_cor
+```
+
+
+### PCA
+```{r}
+pca = prcomp(na.omit(train_noID[var_num]), scale = TRUE)
+# scree plot
+fviz_eig(pca, ncp = 44)
+# plot relationship of variables
+p_pca = fviz_pca_var(pca,
+                     col.var = "contrib", # Color by contributions to the PC
+                     gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                     repel = TRUE)     # Avoid text overlapping
+p_pca
+```
+
+
+## Relationship between binary variables
+```{r}
+# the relationship between binary variables
+var_bin = names(train_noID)[grepl("_bin", names(train_noID))]
+crossprod(data.matrix(train_noID[var_bin]))
+sum(train_noID$ps_ind_06_bin + train_noID$ps_ind_07_bin + 
+        train_noID$ps_ind_08_bin + train_noID$ps_ind_09_bin == 1)
+sum(train_noID$ps_ind_16_bin + train_noID$ps_ind_17_bin + train_noID$ps_ind_18_bin == 1)
+sum(train_noID$ps_ind_10_bin + train_noID$ps_ind_11_bin + train_noID$ps_ind_12_bin + 
+        train_noID$ps_ind_13_bin == train_noID$ps_ind_14)
+# conclusion: ps_ind_06_bin, ps_ind_07_bin, ps_ind_08_bin, ps_ind_09_bin are one hot encoding, 
+#             so one of them is redundant in modeling 
+# conclusion: ps_ind_06_bin, ps_ind_07_bin, ps_ind_08_bin, ps_ind_09_bin are one hot encoding, 
+```
+
+
+## Properties of variables with 2 values
+```{r}
+# the properties of variables with 2 values
+# sreturn the length of the unqiue values in each varible, missing value does not count
+var_value = lapply(apply(train_noID, 2, function(x)unique(x[!is.na(x)])), length) 
+var_2value = names(var_value)[lapply(var_value, function(x)x==2) == TRUE]
+prop.table(apply(train_noID[var_2value], 2, table), 2)
+```
+
+
+## Missing data analysis
+```{r}
+# missing data analysis
+# md.pattern(train_noID) # need to report percentage of missing data
+aggr(train_noID, 
+     prop = F, 
+     numbers = T, 
+     cex.axis = .6)
+# Create a correlation matrix: missing values of some of the variables have high correlationsz
+miss_ind = as.data.frame(abs(is.na(train_noID)))
+round(cor(miss_ind[, sapply(miss_ind, sd) > 0]), 2)
+```
+
+# Data preprocessing
+
+## Missing data imputation
+```{r, eval=FALSE}
+# missing data imputation
+train_mi_impute = mice(train_bal,
+                       m = 3,
+                       maxit = 5,
+                       seed = 11,
+                       MaxNWts = 5000,
+                       printFlag = TRUE)
+train_comp = complete(train_mi_impute, action = 1) # use this as an example
+train_comp = complete(train_mi_impute)
+sum(is.na(train_comp))
+str(train_comp)
+```
+
+
+## Data rebalancing via downsampling
+```{r}
+# for demo purpose
+train_comp = na.omit(train_noID)
+table(train_comp$target)
+
+# imbalanced data --> balance sampling
+train_zero = train_comp %>% filter(target == 0)
+set.seed(22)
+train_bal = rbind(train_zero[sample(1:nrow(train_zero),
+                                      size = sum(train_comp$target == 1),
+                                      replace = FALSE), ], 
+                  train_comp[which(train_comp$target == 1), ])
+str(train_bal)
+
+## remove redundant features
+train_bal[c("ps_ind_09_bin", "ps_ind_14")] = NULL
+
+```
+
+
+## remove redundant features
+```{r}
+train_bal[c("ps_ind_09_bin", "ps_ind_14")] = NULL
+```
+
+
+# Modeling
+
+## data spliting
+```{r}
+# randomly order the data for spliting into train and dev
+set.seed(33)
+train_bal = train_bal[sample(nrow(train_bal)), ]
+split = round(nrow(train_bal)*.80)
+train_mod = train_bal[1: split, ]
+dev_mod = train_bal[(split+1):nrow(train_bal), ]
+# confirm the split
+nrow(train_mod) / nrow(dev_mod)
+```
+
+
+## logistic regression 
+```{r, eval=FALSE}
+mod_lr = glm(data = train_mod, formula = target ~ ., family = binomial(link='logit'))
+# predict on test
+p_lr = predict(mod_lr, dev_mod, type = "response")
+# assign the classes
+p_lr_target = ifelse(p_lr > .50, 1, 0)
+# create the confusion matrix
+table(p_lr_target, dev_mod[["target"]]) # precision = 0.55 recall = 0.60
+# use the caret's helper function to calculate additional statistics
+confusionMatrix(p_lr_target, dev_mod[["target"]])
+# plot the ROC curve
+colAUC(p_lr_target, dev_mod[["target"]], plotROC = TRUE)
+```
+
+
+## using caret
+```{r}
+trainControl = trainControl(method = "cv", 
+                            number = 2, 
+                            summaryFunction = twoClassSummary,
+                            classProbs = TRUE,
+                            verboseIter = TRUE)
+```
+
+
+## random forest
+```{r message=FALSE, warning=FALSE}
+# fit a randomly forest model using tuneLength with a single tuning parameter mtry
+set.seed(123)
+train_bal$target = as.factor(train_bal$target)
+levels(train_bal$target) = make.names(levels(factor(train_bal$target)))
+# method: http://topepo.github.io/caret/train-models-by-tag.html
+mod_rf = train(as.factor(target) ~.,
+                tuneLength = 1,  # tuneLength: the total number of unique combinations specified
+                data = train_bal, 
+                method = "rf",
+                metric = "ROC",
+                trControl = trainControl,
+               tuneGrid = data.frame(mtry = c(5, 8))) 
+# print metrics ROC, sensitivity and specificity
+print(mod_rf)
+# print variable importance
+varImp(mod_rf)
+plot(varImp(mod_rf), top = 10)
+```
+
+
+## gbm
+```{r message=FALSE, warning=FALSE}
+mod_gbm = train(as.factor(target) ~.,
+                data = train_bal, 
+                method = "gbm",
+                metric = "ROC",
+                trControl = trainControl,
+                bag.fraction = 0.75, 
+                tuneGrid = expand.grid(interaction.depth = 7, 
+                                       n.trees = 50, 
+                                       shrinkage = .05, 
+                                       n.minobsinnode = 10))
+# print metrics ROC, sensitivity and specificity
+print(mod_gbm)
+# print variable importance
+varImp(mod_gbm)
+plot(varImp(mod_gbm), top = 10)
+```
+
+
+## xgboost
+```{r message=FALSE, warning=FALSE}
+mod_xgb = train(as.factor(target) ~.,
+               data = train_bal, 
+               tuneLength = 1, 
+               method = "xgbTree",
+               metric = "ROC",
+               trControl = trainControl,
+               nthread = 4)
+# print metrics ROC, sensitivity and specificity
+print(mod_xgb)
+# print variable importance
+varImp(mod_xgb)
+plot(varImp(mod_xgb), top = 10)
+```
+
+
+## neural networks
+```{r message=FALSE, warning=FALSE}
+mod_nnet = train(as.factor(target) ~.,
+               data = train_bal, 
+               tuneLength = 1, 
+               method = "nnet",
+               metric = "ROC",
+               tuneGrid = expand.grid(decay = 0.1, 
+                                      size = 2), 
+               trControl = trainControl(summaryFunction = twoClassSummary,
+                            classProbs = TRUE,
+                            verboseIter = TRUE),
+               maxit = 10,
+               trace = F)
+# print metrics ROC, sensitivity and specificity
+print(mod_nnet)
+# print variable importance
+varImp(mod_nnet)
+plot(varImp(mod_nnet), top = 10)
+```
